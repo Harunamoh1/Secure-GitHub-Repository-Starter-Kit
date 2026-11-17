@@ -1,0 +1,23 @@
+# CodeQL configuration
+# Docs: https://docs.github.com/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning
+
+name: "Security baseline CodeQL config"
+
+# "security-extended" adds lower-precision and lower-severity security queries
+# to the default suite. Use "security-and-quality" to also get maintainability
+# findings, or remove this block to run only the default suite.
+queries:
+  - uses: security-extended
+
+# Code that is not yours or not shipped. Findings here are mostly noise.
+paths-ignore:
+  - "**/node_modules/**"
+  - "**/vendor/**"
+  - "**/third_party/**"
+  - "**/dist/**"
+  - "**/build/**"
+  - "**/*.min.js"
+  # Uncomment to skip tests as well:
+  # - "**/test/**"
+  # - "**/tests/**"
+  # - "**/__tests__/**"

@@ -1,0 +1,316 @@
+# Security baseline workflow
+#
+# Jobs:
+#   secret-scan        Gitleaks scans new commits for leaked credentials.
+#   codeql-languages   Works out which CodeQL languages apply to this repository.
+#   codeql             GitHub CodeQL static analysis (SAST), one job per language.
+#   dependency-review  Blocks pull requests that add known-vulnerable dependencies.
+#   security-gate      One stable status check to mark as "required" in branch protection.
+#
+# Before relying on this workflow, finish the setup checklist in the starter kit's
+# docs/setup-checklist.md: some jobs need repository features turned on.
+#
+# Third-party actions are pinned to full commit SHAs. Dependabot (see
+# .github/dependabot.yml) keeps the pins and the version comments up to date.
+
+name: Security
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  schedule:
+    # Weekly full scan, Monday 05:17 UTC, so new CodeQL queries and newly
+    # published secret patterns are applied to code that has not changed.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# Deny everything by default; each job asks only for what it needs.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  # SHA-256 of the official release archives, from gitleaks_<version>_checksums.txt.
+  # Update these together with GITLEAKS_VERSION.
+  GITLEAKS_SHA256_X64: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  GITLEAKS_SHA256_ARM64: "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"
+
+jobs:
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # upload the SARIF report to code scanning
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Gitleaks scans commits, so it needs history
+          persist-credentials: false
+
+      - name: Install Gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          case "${RUNNER_ARCH}" in
+            X64)   arch=x64;   want="${GITLEAKS_SHA256_X64}" ;;
+            ARM64) arch=arm64; want="${GITLEAKS_SHA256_ARM64}" ;;
+            *) echo "::error::Unsupported runner architecture: ${RUNNER_ARCH}"; exit 1 ;;
+          esac
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_${arch}.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${want}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/gitleaks"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/gitleaks" gitleaks
+          echo "${RUNNER_TEMP}/gitleaks" >> "${GITHUB_PATH}"
+
+      - name: Scan commits for secrets
+        id: scan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          gitleaks version
+
+          # Pick the commit range. Pushes and pull requests scan only the new
+          # commits; scheduled and manual runs scan the whole history.
+          log_opts=""
+          case "${EVENT_NAME}" in
+            pull_request)
+              log_opts="${PR_BASE_SHA}..${PR_HEAD_SHA}"
+              ;;
+            push)
+              if [[ -n "${PUSH_BEFORE}" && ! "${PUSH_BEFORE}" =~ ^0+$ ]] \
+                 && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                log_opts="${PUSH_BEFORE}..${PUSH_AFTER}"
+              elif git rev-parse --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}" >/dev/null \
+                   && [[ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]]; then
+                # New branch or force push: commits not already on the default branch.
+                log_opts="${PUSH_AFTER} --not origin/${DEFAULT_BRANCH}"
+              else
+                # First push of the default branch: everything reachable from it.
+                log_opts="${PUSH_AFTER}"
+              fi
+              ;;
+          esac
+
+          args=(git . --redact --no-banner --exit-code 1
+                --report-format sarif --report-path gitleaks.sarif)
+          if [[ -f .gitleaks.toml ]]; then
+            args+=(--config .gitleaks.toml)
+          fi
+          if [[ -n "${log_opts}" ]]; then
+            args+=("--log-opts=${log_opts}")
+            echo "Scanning commit range: ${log_opts}"
+          else
+            echo "Scanning full history"
+          fi
+
+          status=0
+          gitleaks "${args[@]}" || status=$?
+          echo "exit-code=${status}" >> "${GITHUB_OUTPUT}"
+          [[ -f gitleaks.sarif ]] && echo "sarif=true" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Gitleaks secret scan"
+            if [[ "${status}" -eq 0 ]]; then
+              echo "No secrets found."
+            elif [[ -f gitleaks.sarif ]]; then
+              echo "**Possible secrets found.** Values are redacted."
+              echo
+              echo "| Rule | File | Line | Commit |"
+              echo "|---|---|---|---|"
+              jq -r '.runs[].results[] |
+                "| \(.ruleId) | \(.locations[0].physicalLocation.artifactLocation.uri // "-")" +
+                " | \(.locations[0].physicalLocation.region.startLine // "-")" +
+                " | \((.partialFingerprints.commitSha // "-")[0:12]) |"' gitleaks.sarif
+              echo
+              echo "See the starter kit's docs/customization.md#secret-scanning for what to do next."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${status}" -eq 1 ]]; then
+            echo "::error::Gitleaks found possible secrets. Rotate any real credential first, then remove it from the code."
+          fi
+          exit "${status}"
+
+      - name: Upload results to code scanning
+        # Runs even when leaks were found. Skipped for fork pull requests, whose
+        # token cannot write security events. continue-on-error keeps the job's
+        # verdict tied to the scan, not to whether code scanning is available.
+        if: >-
+          always() && steps.scan.outputs.sarif == 'true' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+  codeql-languages:
+    name: Detect CodeQL languages
+    # CodeQL runs on pull requests, on pushes to the default branch and on
+    # schedule. Pushes to other branches are covered once they are in a PR.
+    if: >-
+      github.event_name != 'push' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - name: Build language matrix
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Optional repository variable to override detection, e.g.
+          #   "python,javascript-typescript"  or  "java-kotlin:autobuild,actions"
+          OVERRIDE: ${{ vars.CODEQL_LANGUAGES }}
+        run: |
+          set -euo pipefail
+
+          # "<codeql-language> <build-mode> <runner>" for each GitHub linguist language.
+          map_language() {
+            case "$1" in
+              C|C++|Objective-C|Objective-C++) echo "c-cpp autobuild ubuntu-latest" ;;
+              C#)                              echo "csharp none ubuntu-latest" ;;
+              Go)                              echo "go autobuild ubuntu-latest" ;;
+              Java|Kotlin)                     echo "java-kotlin none ubuntu-latest" ;;
+              JavaScript|TypeScript|Vue|Svelte) echo "javascript-typescript none ubuntu-latest" ;;
+              Python)                          echo "python none ubuntu-latest" ;;
+              Ruby)                            echo "ruby none ubuntu-latest" ;;
+              Rust)                            echo "rust none ubuntu-latest" ;;
+              Swift)                           echo "swift autobuild macos-latest" ;;
+            esac
+          }
+          default_mode() {
+            case "$1" in
+              c-cpp|go|swift) echo autobuild ;;
+              *)              echo none ;;
+            esac
+          }
+
+          entries=""
+          if [[ -n "${OVERRIDE}" ]]; then
+            for item in ${OVERRIDE//,/ }; do
+              lang="${item%%:*}"
+              mode="$(default_mode "${lang}")"
+              [[ "${item}" == *:* ]] && mode="${item#*:}"
+              runner=ubuntu-latest
+              [[ "${lang}" == swift ]] && runner=macos-latest
+              entries+="${lang} ${mode} ${runner}"$'\n'
+            done
+          else
+            while IFS= read -r linguist; do
+              m="$(map_language "${linguist}")"
+              [[ -n "${m}" ]] && entries+="${m}"$'\n'
+            done < <(gh api "repos/${REPO}/languages" --jq 'keys[]')
+            # Always analyse GitHub Actions workflows themselves.
+            entries+="actions none ubuntu-latest"$'\n'
+          fi
+
+          matrix="$(printf '%s' "${entries}" | sort -u | jq -R -s -c '
+            split("\n") | map(select(length > 0) | split(" ") |
+              {language: .[0], "build-mode": .[1], runner: .[2]})')"
+          echo "CodeQL matrix: ${matrix}"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: codeql-languages
+    if: needs.codeql-languages.outputs.matrix != '[]'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      actions: read # needed in private repositories
+      contents: read
+      packages: read # fetch CodeQL packs from GitHub Packages
+      security-events: write # upload results
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.codeql-languages.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      # For build-mode "manual" (set through the CODEQL_LANGUAGES variable),
+      # replace this step with the commands that build your project.
+      - name: Build (manual mode)
+        if: matrix.build-mode == 'manual'
+        run: |
+          echo "::error::CodeQL build-mode is 'manual' for ${{ matrix.language }} but no build commands are defined. Edit the 'Build (manual mode)' step in .github/workflows/security.yml."
+          exit 1
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # post the summary comment on the PR
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          config-file: ./.github/dependency-review-config.yml
+          # Fork PRs get a read-only token and cannot comment.
+          comment-summary-in-pr: ${{ github.event.pull_request.head.repo.full_name == github.repository && 'on-failure' || 'never' }}
+
+  security-gate:
+    name: Security gate
+    # Matrix job names change with your languages, so require this one check in
+    # branch protection instead of each job. Skipped jobs count as passing.
+    if: always()
+    needs: [secret-scan, codeql-languages, codeql, dependency-review]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "${RESULTS}" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          failed="$(echo "${RESULTS}" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')"
+          if [[ -n "${failed}" ]]; then
+            echo "::error::Security checks did not pass: ${failed}"
+            exit 1
+          fi
+          echo "All security checks passed or were not applicable."
