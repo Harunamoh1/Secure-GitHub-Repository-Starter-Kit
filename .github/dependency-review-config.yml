@@ -1,0 +1,41 @@
+# Configuration for actions/dependency-review-action
+# Docs: https://github.com/actions/dependency-review-action#configuration-options
+#
+# The check runs on pull requests and compares the dependency manifests of the
+# base and head commits. It needs the dependency graph to be enabled.
+
+# Fail on newly added dependencies with a known vulnerability of this severity
+# or higher: low, moderate, high or critical.
+fail-on-severity: moderate
+
+# Which dependency scopes can fail the check: runtime, development, unknown.
+# Development dependencies still appear in the summary.
+fail-on-scopes:
+  - runtime
+  - unknown
+
+vulnerability-check: true
+
+# Show OpenSSF Scorecard results for new dependencies and warn below this score.
+show-openssf-scorecard: true
+warn-on-openssf-scorecard-level: 3
+
+# Retry when the dependency snapshot from a build is not yet available.
+retry-on-snapshot-warnings: true
+
+# Advisories you have reviewed and accepted. Record why next to each one.
+# allow-ghsas:
+#   - GHSA-xxxx-xxxx-xxxx   # not reachable: only used in tests, see #123
+
+# License policy. Off by default; turn it on and list either allowed or
+# denied licenses (SPDX identifiers), not both.
+license-check: false
+# allow-licenses:
+#   - MIT
+#   - Apache-2.0
+#   - BSD-2-Clause
+#   - BSD-3-Clause
+#   - ISC
+# deny-licenses:
+#   - GPL-3.0-only
+#   - AGPL-3.0-only

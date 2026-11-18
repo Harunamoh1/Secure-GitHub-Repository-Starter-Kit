@@ -1,0 +1,40 @@
+# Gitleaks configuration
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+#
+# Starts from Gitleaks' built-in rule set (150+ providers: AWS, GCP, Azure,
+# GitHub, Slack, Stripe, private keys, JWTs and more) and adds a small,
+# reviewed allowlist. Keep allowlists narrow: every entry is a place a real
+# secret could hide unnoticed.
+
+title = "Security baseline Gitleaks config"
+
+[extend]
+useDefault = true
+# Turn off a built-in rule only if it is consistently wrong for this repo:
+# disabledRules = ["generic-api-key"]
+
+[[allowlists]]
+description = "Files that cannot hold usable secrets"
+paths = [
+  # Lockfiles contain integrity hashes that look like keys.
+  '''(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|uv\.lock|Cargo\.lock|go\.sum|composer\.lock|Gemfile\.lock)$''',
+  # Binary and media files.
+  '''\.(png|jpe?g|gif|ico|svg|webp|pdf|woff2?|ttf|eot|mp4|zip|gz)$''',
+]
+
+# Example: allow a documented placeholder value everywhere.
+# [[allowlists]]
+# description = "Documentation placeholders"
+# regexTarget = "match"
+# regexes = ['''EXAMPLE_TOKEN_DO_NOT_USE''']
+
+# Example: your own rule for an internal token format.
+# [[rules]]
+# id = "acme-internal-token"
+# description = "ACME internal service token"
+# regex = '''acme_(live|test)_[0-9a-zA-Z]{32}'''
+# keywords = ["acme_live_", "acme_test_"]
+#
+# To ignore one specific finding that is a confirmed false positive, add its
+# fingerprint (shown in the Gitleaks report) to a .gitleaksignore file instead
+# of widening the allowlist.

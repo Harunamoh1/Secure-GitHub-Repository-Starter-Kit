@@ -1,0 +1,159 @@
+# Tests for the starter kit itself. Not part of the baseline: install.sh does
+# not copy this file, and repositories created from the template can delete it.
+
+name: Validate kit
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+
+jobs:
+  lint:
+    name: Lint workflows and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (checksum verified)
+        run: |
+          set -euo pipefail
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" actionlint
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: actionlint (includes ShellCheck on run steps)
+        run: actionlint -color
+
+      - name: ShellCheck scripts
+        run: shellcheck scripts/*.sh
+
+      - name: Parse YAML and TOML configs
+        run: |
+          python3 - <<'EOF'
+          import sys, tomllib, yaml
+          for path in [".github/dependabot.yml",
+                       ".github/dependency-review-config.yml",
+                       ".github/codeql/codeql-config.yml"]:
+              with open(path) as f:
+                  yaml.safe_load(f)
+              print("ok", path)
+          with open(".gitleaks.toml", "rb") as f:
+              tomllib.load(f)
+          print("ok .gitleaks.toml")
+          EOF
+
+  install-script:
+    name: Test install.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install into an empty repository
+        run: |
+          set -euo pipefail
+          target="${RUNNER_TEMP}/target"
+          git init -q "${target}"
+
+          scripts/install.sh --dry-run "${target}"
+          test -z "$(find "${target}" -mindepth 1 -maxdepth 1 ! -name .git)" || { echo "dry run wrote files"; exit 1; }
+
+          scripts/install.sh "${target}"
+          for f in .github/workflows/security.yml .github/dependabot.yml \
+                   .github/dependency-review-config.yml .github/codeql/codeql-config.yml \
+                   .gitleaks.toml SECURITY.md; do
+            cmp "${f}" "${target}/${f}"
+          done
+          test ! -e "${target}/.github/workflows/validate-kit.yml"
+
+          # Existing, different files are kept unless --force is used.
+          echo "# mine" > "${target}/SECURITY.md"
+          out="$(scripts/install.sh "${target}")"
+          grep -q "skipped    SECURITY.md" <<< "${out}"
+          grep -qx "# mine" "${target}/SECURITY.md"
+          out="$(scripts/install.sh --force "${target}")"
+          grep -q "replaced   SECURITY.md" <<< "${out}"
+          cmp SECURITY.md "${target}/SECURITY.md"
+          grep -qx "# mine" "${target}/SECURITY.md.bak"
+          echo "install.sh behaves as expected"
+
+  gitleaks-config:
+    name: Test Gitleaks config
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Gitleaks (version and checksum from security.yml)
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^  GITLEAKS_VERSION: "\(.*\)"$/\1/p' .github/workflows/security.yml)"
+          sha="$(sed -n 's/^  GITLEAKS_SHA256_X64: "\(.*\)"$/\1/p' .github/workflows/security.yml)"
+          test -n "${version}" && test -n "${sha}"
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}"
+          echo "${sha}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" gitleaks
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+      - name: Clean files pass
+        run: |
+          set -euo pipefail
+          clean="${RUNNER_TEMP}/clean"
+          mkdir -p "${clean}"
+          printf 'api_url = "https://api.example.com"\ntimeout = 30\n' > "${clean}/settings.toml"
+          gitleaks dir "${clean}" --config .gitleaks.toml --no-banner --redact
+
+      - name: A generated fake token is detected
+        run: |
+          set -euo pipefail
+          leaky="${RUNNER_TEMP}/leaky"
+          mkdir -p "${leaky}"
+          # Built at runtime so no token-shaped string is ever committed here.
+          token="ghp_$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36)))')"
+          printf 'GITHUB_TOKEN=%s\n' "${token}" > "${leaky}/.env"
+          status=0
+          gitleaks dir "${leaky}" --config .gitleaks.toml --no-banner --redact || status=$?
+          if [[ "${status}" -ne 1 ]]; then
+            echo "::error::Expected Gitleaks to report the fake token (exit 1), got exit ${status}"
+            exit 1
+          fi
+          echo "Fake token detected as expected"
+
+      - name: Lockfiles are allowlisted
+        run: |
+          set -euo pipefail
+          lock="${RUNNER_TEMP}/lock"
+          mkdir -p "${lock}"
+          token="ghp_$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36)))')"
+          printf '{"integrity": "%s"}\n' "${token}" > "${lock}/package-lock.json"
+          gitleaks dir "${lock}" --config .gitleaks.toml --no-banner --redact
